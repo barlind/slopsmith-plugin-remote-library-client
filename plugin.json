@@ -1,0 +1,20 @@
+{
+  "id": "remote_library_client",
+  "name": "Remote Library Client",
+  "version": "0.1.0",
+  "private": false,
+  "nav": { "label": "Remote Client", "screen": "remote-library-client" },
+  "screen": "screen.html",
+  "settings": { "html": "settings.html" },
+  "script": "screen.js",
+  "routes": "routes.py",
+  "standards": ["plugin-runtime-idempotent.v1"],
+  "capabilities": {
+    "remote-library-client": {
+      "roles": ["consumer"],
+      "commands": ["connect", "browse", "sync", "remove"],
+      "events": ["remote-library-client.activity"],
+      "mode": "optional"
+    }
+  }
+}
