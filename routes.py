@@ -12,6 +12,9 @@ _store: RemoteLibraryClientStore | None = None
 _register_provider = None
 _unregister_provider = None
 _cache_dir: Path | None = None
+_get_dlc_dir = None
+_extract_meta = None
+_meta_db = None
 _providers: dict[str, DirectLibraryProvider] = {}
 
 
@@ -30,7 +33,21 @@ def _source_cache_dir() -> Path:
 
 
 def _provider_for_source(source: dict) -> DirectLibraryProvider:
-    return DirectLibraryProvider(source, _source_cache_dir())
+    local_root = _get_dlc_dir() if callable(_get_dlc_dir) else None
+    return DirectLibraryProvider(source, _source_cache_dir(), local_root, _import_library_file)
+
+
+def _import_library_file(package_path: Path, local_root: Path) -> dict | None:
+    if not callable(_extract_meta) or _meta_db is None or not hasattr(_meta_db, "put"):
+        return None
+    metadata = _extract_meta(package_path)
+    stat = package_path.stat()
+    try:
+        filename = package_path.relative_to(local_root).as_posix()
+    except ValueError:
+        filename = package_path.name
+    _meta_db.put(filename, stat.st_mtime, stat.st_size, metadata)
+    return {"libraryImportState": "indexed", "libraryFilename": filename}
 
 
 def _register_source_provider(source: dict, *, replace: bool = True) -> DirectLibraryProvider | None:
@@ -56,7 +73,7 @@ def _probe_source(base_url: str) -> dict:
         "providerId": provider_id_for_source("probe", base_url),
         "label": base_url,
     }, _source_cache_dir())
-    return probe._json("/source")
+    return probe._json("/source", timeout=3)
 
 
 def _source_from_payload(base_url: str, payload: dict, label: str = "") -> dict:
@@ -74,11 +91,28 @@ def _source_from_payload(base_url: str, payload: dict, label: str = "") -> dict:
     }
 
 
+def _source_fallback(base_url: str, label: str = "") -> dict:
+    source_name = str(label or base_url)
+    provider_id = provider_id_for_source("", base_url)
+    return {
+        "providerId": provider_id,
+        "baseUrl": base_url,
+        "sourceId": "",
+        "sourceName": source_name,
+        "label": source_name,
+        "protocol": "slopsmith-direct-library.v1",
+        "songCount": 0,
+    }
+
+
 def setup(app, context):
-    global _store, _register_provider, _unregister_provider, _cache_dir
+    global _store, _register_provider, _unregister_provider, _cache_dir, _get_dlc_dir, _extract_meta, _meta_db
     _store = RemoteLibraryClientStore(Path(context["config_dir"]))
     _register_provider = context.get("register_library_provider")
     _unregister_provider = context.get("unregister_library_provider")
+    _get_dlc_dir = context.get("get_dlc_dir")
+    _extract_meta = context.get("extract_meta")
+    _meta_db = context.get("meta_db")
     cache_factory = context.get("get_sloppak_cache_dir")
     _cache_dir = Path(cache_factory()) / "remote_library_client" if callable(cache_factory) else _store.root / "cache"
     for source in _store.list_sources():
@@ -109,8 +143,14 @@ def setup(app, context):
     def add_source(data: dict):
         try:
             base_url = _normalize_base_url(data.get("baseUrl") or data.get("url") or "")
-            payload = _probe_source(base_url)
-            source = _source_from_payload(base_url, payload, str(data.get("label") or "").strip())
+            label = str(data.get("label") or "").strip()
+            try:
+                payload = _probe_source(base_url)
+                source = _source_from_payload(base_url, payload, label)
+            except Exception:
+                # Save first even if the endpoint is currently unreachable;
+                # status/refresh will surface connectivity problems.
+                source = _source_fallback(base_url, label)
             provider = _register_source_provider(source, replace=True)
             _store.upsert_source(source)
             return {"ok": True, "source": source, "provider": {"id": provider.id, "label": provider.label}}

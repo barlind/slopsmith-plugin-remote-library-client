@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 
 from remote_library_client.provider import DirectLibraryProvider, provider_id_for_source
@@ -15,7 +13,6 @@ SONGS = [
         "album": "Bench",
         "format": "psarc",
         "packageForm": "psarc-file",
-        "packageHash": "sha256:" + hashlib.sha256(b"package-one").hexdigest(),
         "arrangements": [{"name": "Lead"}],
         "has_lyrics": True,
         "tuning": "E Standard",
@@ -28,29 +25,85 @@ SONGS = [
         "album": "Bench",
         "format": "sloppak",
         "packageForm": "sloppak-zip",
-        "packageHash": "sha256:" + hashlib.sha256(b"package-two").hexdigest(),
         "arrangements": [{"name": "Rhythm"}],
         "has_lyrics": False,
+        "stem_count": 4,
+        "stem_ids": ["drums", "bass", "guitar", "vocals"],
         "tuning": "Drop D",
     },
 ]
 
 
 class FakeProvider(DirectLibraryProvider):
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, local_library_root=None, library_importer=None):
         super().__init__({
             "baseUrl": "https://studio.example.test",
             "providerId": provider_id_for_source("direct_studio", "https://studio.example.test"),
             "sourceId": "direct_studio",
             "label": "Studio",
-        }, tmp_path)
+        }, tmp_path, local_library_root, library_importer)
+        self.json_calls: list[tuple[str, dict]] = []
 
-    def _json(self, path: str, params: dict | None = None) -> dict:
+    def _json(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
+        params = params or {}
+        self.json_calls.append((path, dict(params)))
+        if path.startswith("/songs/"):
+            song_id = path.split("/", 2)[-1]
+            song = next((item for item in SONGS if item["remoteSongId"] == song_id), None)
+            if not song:
+                raise RuntimeError('{"detail":"song not found"}')
+            return dict(song)
+        if path == "/artists":
+            return {
+                "artists": [{
+                    "name": "The Fixtures",
+                    "album_count": 1,
+                    "song_count": len(SONGS),
+                    "albums": [{"name": "Bench", "songs": SONGS}],
+                }],
+                "total_artists": 1,
+                "query": {"filtersApplied": True},
+            }
+        if path == "/stats":
+            return {
+                "total_songs": len(SONGS),
+                "total_artists": 1,
+                "letters": {"T": 1},
+                "query": {"filtersApplied": True},
+            }
+        if path == "/tuning-names":
+            return {"tunings": [
+                {"name": "Drop D", "sort_key": 0, "count": 1},
+                {"name": "E Standard", "sort_key": 0, "count": 1},
+            ]}
         if path != "/songs":
             raise AssertionError(path)
-        q = (params or {}).get("q") or ""
+        q = params.get("q") or ""
         songs = [song for song in SONGS if q.lower() in song["title"].lower()]
-        return {"songs": songs, "nextCursor": None}
+        arrangements_has = {item for item in str(params.get("arrangements_has") or "").split(",") if item}
+        stems_has = {item for item in str(params.get("stems_has") or "").split(",") if item}
+        stems_lacks = {item for item in str(params.get("stems_lacks") or "").split(",") if item}
+        tunings = {item for item in str(params.get("tunings") or "").split(",") if item}
+        if arrangements_has:
+            songs = [
+                song for song in songs
+                if arrangements_has.intersection({item.get("name") for item in song.get("arrangements") or []})
+            ]
+        if stems_has:
+            songs = [song for song in songs if stems_has.issubset(set(song.get("stem_ids") or []))]
+        if stems_lacks:
+            songs = [song for song in songs if not stems_lacks.intersection(set(song.get("stem_ids") or []))]
+        if tunings:
+            songs = [song for song in songs if song.get("tuning") in tunings]
+        page_size = int(params.get("pageSize") or len(songs) or 1)
+        page = int(params.get("page") or 0)
+        offset = page * page_size
+        return {
+            "songs": songs[offset:offset + page_size],
+            "total": len(songs),
+            "nextCursor": str(offset + page_size) if offset + page_size < len(songs) else None,
+            "query": {"filtersApplied": True},
+        }
 
     def _bytes(self, path: str, params: dict | None = None):
         if path.endswith("/art"):
@@ -78,6 +131,58 @@ def test_query_page_filters_and_normalizes(tmp_path):
     assert songs[0]["artist"] == "The Fixtures"
 
 
+def test_repeated_metadata_queries_use_cache(tmp_path):
+    provider = FakeProvider(tmp_path)
+
+    first_songs, first_total = provider.query_page(q="tone", size=10)
+    second_songs, second_total = provider.query_page(q="tone", size=10)
+    provider.query_stats()
+    provider.query_stats()
+    provider.tuning_names()
+    provider.tuning_names()
+
+    assert first_total == second_total == 2
+    assert first_songs == second_songs
+    assert [path for path, _params in provider.json_calls].count("/songs") == 1
+    assert [path for path, _params in provider.json_calls].count("/stats") == 1
+    assert [path for path, _params in provider.json_calls].count("/tuning-names") == 1
+
+
+def test_metadata_cache_can_be_cleared(tmp_path):
+    provider = FakeProvider(tmp_path)
+
+    provider.query_page(q="tone", size=10)
+    provider.clear_metadata_cache()
+    provider.query_page(q="tone", size=10)
+
+    assert [path for path, _params in provider.json_calls].count("/songs") == 2
+
+
+def test_query_page_preserves_stem_metadata_and_filters(tmp_path):
+    provider = FakeProvider(tmp_path)
+
+    songs, total = provider.query_page(q="tone", size=10, stems_has=["drums"], stems_lacks=["piano"])
+
+    assert total == 1
+    assert songs[0]["filename"] == "song-two"
+    assert songs[0]["stem_count"] == 4
+    assert songs[0]["stem_ids"] == ["drums", "bass", "guitar", "vocals"]
+
+
+def test_query_page_does_not_scan_local_library_for_matching_package(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    (local_root / "local-song-one.psarc").write_bytes(b"package-one")
+    provider = FakeProvider(tmp_path / "cache", local_root)
+
+    songs, total = provider.query_page(q="clean", size=10)
+
+    assert total == 1
+    assert songs[0]["localFilename"] == ""
+    assert songs[0]["local_filename"] == ""
+    assert songs[0]["playFilename"] == ""
+
+
 def test_artist_stats_and_tunings(tmp_path):
     provider = FakeProvider(tmp_path)
 
@@ -101,6 +206,19 @@ def test_art_proxy_returns_response(tmp_path):
     assert response.media_type == "image/png"
 
 
+def test_missing_remote_art_returns_none(tmp_path):
+    provider = FakeProvider(tmp_path)
+
+    def missing_art(path: str, params: dict | None = None):
+        if path.endswith("/art"):
+            raise RuntimeError('{"detail":"artwork not found"}')
+        raise AssertionError(path)
+
+    provider._bytes = missing_art
+
+    assert provider.get_art("song-one") is None
+
+
 def test_sync_downloads_to_plugin_cache(tmp_path):
     provider = FakeProvider(tmp_path)
 
@@ -109,20 +227,67 @@ def test_sync_downloads_to_plugin_cache(tmp_path):
     cached = tmp_path / provider.cache_dir.name / "song-one.psarc"
 
     assert result["ok"] is True
+    assert result["playbackSource"] == "remote-cache"
     assert result["cachedPath"] == str(cached)
     assert cached.read_bytes() == b"package-one"
 
 
-def test_sync_rejects_hash_mismatch(tmp_path):
+def test_sync_imports_to_local_library_when_configured(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    provider = FakeProvider(tmp_path / "cache", local_root)
+
+    result = provider.sync_song("song-one")
+
+    assert result["ok"] is True
+    assert result["playbackSource"] == "library-folder"
+    assert result["filename"] == "direct_studio/song-one.psarc"
+    assert result["localFilename"] == "direct_studio/song-one.psarc"
+    assert result["playFilename"] == "direct_studio/song-one.psarc"
+    assert (local_root / "direct_studio" / "song-one.psarc").read_bytes() == b"package-one"
+
+
+def test_sync_indexes_local_library_file_when_importer_available(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    imported = []
+
+    def import_library_file(package_path, root):
+        imported.append((package_path, root))
+        return {"libraryImportState": "indexed", "libraryFilename": package_path.relative_to(root).as_posix()}
+
+    provider = FakeProvider(tmp_path / "cache", local_root, import_library_file)
+
+    result = provider.sync_song("song-one")
+
+    assert imported == [(local_root / "direct_studio" / "song-one.psarc", local_root)]
+    assert result["libraryImportState"] == "indexed"
+    assert result["libraryFilename"] == "direct_studio/song-one.psarc"
+
+
+def test_sync_allocates_unique_local_library_name_on_content_conflict(tmp_path):
+    local_root = tmp_path / "dlc"
+    target_dir = local_root / "direct_studio"
+    target_dir.mkdir(parents=True)
+    (target_dir / "song-one.psarc").write_bytes(b"different")
+    provider = FakeProvider(tmp_path / "cache", local_root)
+
+    result = provider.sync_song("song-one")
+
+    assert result["filename"] == "direct_studio/song-one-2.psarc"
+    assert (target_dir / "song-one.psarc").read_bytes() == b"different"
+    assert (target_dir / "song-one-2.psarc").read_bytes() == b"package-one"
+
+
+def test_sync_surfaces_package_download_errors(tmp_path):
     provider = FakeProvider(tmp_path)
-    original_bytes = provider._bytes
 
-    def wrong_bytes(path: str, params: dict | None = None):
+    def missing_package(path: str, params: dict | None = None):
         if path.endswith("/package"):
-            return b"wrong", "application/octet-stream", {}
-        return original_bytes(path, params)
+            raise RuntimeError('{"detail":"package not found"}')
+        raise AssertionError(path)
 
-    provider._bytes = wrong_bytes
+    provider._bytes = missing_package
 
-    with pytest.raises(RuntimeError, match="hash"):
+    with pytest.raises(RuntimeError, match="package not found"):
         provider.sync_song("song-one")
