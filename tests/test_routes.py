@@ -225,3 +225,38 @@ def test_disable_source_unregisters_and_skips_status_probe(tmp_path, monkeypatch
     enabled = client.patch(f"/api/plugins/remote_library_client/sources/{provider_id}", json={"enabled": True})
     assert enabled.status_code == 200
     assert enabled.json()["source"]["enabled"] is True
+
+
+def test_source_patch_updates_nam_tone_sync_setting_and_provider(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    registered = {}
+
+    def probe(base_url: str) -> dict:
+        return {
+            "ok": True,
+            "sourceId": "direct_studio",
+            "sourceName": "Studio Source",
+            "songCount": 12,
+            "capabilities": ["library.read", "art.read", "song.sync", "nam-tone-sync.read"],
+            "namToneSync": {"enabled": True},
+            "server": {"protocol": "slopsmith-direct-library.v1"},
+        }
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: registered.__setitem__(provider.id, provider),
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    client = TestClient(app)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://studio.example.test"})
+    provider_id = added.json()["provider"]["id"]
+    updated = client.patch(f"/api/plugins/remote_library_client/sources/{provider_id}", json={"syncNamToneAssets": True})
+
+    assert updated.status_code == 200
+    assert updated.json()["source"]["syncNamToneAssets"] is True
+    assert updated.json()["source"]["namToneSyncAvailable"] is True
+    assert registered[provider_id].source["syncNamToneAssets"] is True

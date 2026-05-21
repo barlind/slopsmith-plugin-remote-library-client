@@ -16,6 +16,7 @@ _cache_dir: Path | None = None
 _get_dlc_dir = None
 _extract_meta = None
 _meta_db = None
+_config_dir: Path | None = None
 _providers: dict[str, DirectLibraryProvider] = {}
 DEFAULT_SOURCE_PORT = 8765
 
@@ -83,7 +84,7 @@ def _source_cache_dir() -> Path:
 
 def _provider_for_source(source: dict) -> DirectLibraryProvider:
     local_root = _get_dlc_dir() if callable(_get_dlc_dir) else None
-    return DirectLibraryProvider(source, _source_cache_dir(), local_root, _import_library_file)
+    return DirectLibraryProvider(source, _source_cache_dir(), local_root, _import_library_file, _config_dir)
 
 
 def _import_library_file(package_path: Path, local_root: Path) -> dict | None:
@@ -140,6 +141,9 @@ def _source_from_payload(base_url: str, payload: dict, label: str = "") -> dict:
         "label": label or source_name,
         "protocol": (payload.get("server") or {}).get("protocol") or "slopsmith-direct-library.v1",
         "songCount": int(payload.get("songCount") or 0),
+        "remoteCapabilities": list(payload.get("capabilities") or []),
+        "namToneSyncAvailable": bool((payload.get("namToneSync") or {}).get("enabled"))
+            or "nam-tone-sync.read" in set(payload.get("capabilities") or []),
         "enabled": True,
         "lastSuccessfulContactAt": _utc_now_iso(),
     }
@@ -166,6 +170,7 @@ def _save_checked_source(source: dict, payload: dict) -> dict:
         **source,
         **_source_from_payload(source.get("baseUrl") or "", payload, source.get("label") or ""),
         "enabled": _source_enabled(source),
+        "syncNamToneAssets": bool(source.get("syncNamToneAssets")),
     }
     old_provider_id = source.get("providerId") or ""
     new_provider_id = updated.get("providerId") or ""
@@ -184,8 +189,9 @@ def _provider_payload(provider: DirectLibraryProvider | None) -> dict | None:
 
 
 def setup(app, context):
-    global _store, _register_provider, _unregister_provider, _cache_dir, _get_dlc_dir, _extract_meta, _meta_db
-    _store = RemoteLibraryClientStore(Path(context["config_dir"]))
+    global _store, _register_provider, _unregister_provider, _cache_dir, _get_dlc_dir, _extract_meta, _meta_db, _config_dir
+    _config_dir = Path(context["config_dir"])
+    _store = RemoteLibraryClientStore(_config_dir)
     _register_provider = context.get("register_library_provider")
     _unregister_provider = context.get("unregister_library_provider")
     _get_dlc_dir = context.get("get_dlc_dir")
@@ -232,7 +238,7 @@ def setup(app, context):
         try:
             base_url, payload = _probe_first_available(data.get("baseUrl") or data.get("url") or "")
             label = str(data.get("label") or "").strip()
-            source = _source_from_payload(base_url, payload, label)
+            source = {**_source_from_payload(base_url, payload, label), "syncNamToneAssets": bool(data.get("syncNamToneAssets"))}
             _store.upsert_source(source)
             provider = _register_source_provider(source, replace=True)
             return {"ok": True, "source": source, "provider": _provider_payload(provider)}
@@ -260,11 +266,16 @@ def setup(app, context):
         source = next((item for item in _store.list_sources() if item.get("providerId") == provider_id), None)
         if not source:
             raise HTTPException(status_code=404, detail="source not found")
-        if "enabled" not in data:
-            raise HTTPException(status_code=400, detail="enabled is required")
-        updated = {**source, "enabled": bool(data.get("enabled"))}
+        allowed = {"enabled", "syncNamToneAssets"}
+        if not any(key in data for key in allowed):
+            raise HTTPException(status_code=400, detail="no supported source settings provided")
+        updated = dict(source)
+        if "enabled" in data:
+            updated["enabled"] = bool(data.get("enabled"))
+        if "syncNamToneAssets" in data:
+            updated["syncNamToneAssets"] = bool(data.get("syncNamToneAssets"))
         _store.upsert_source(updated)
-        if updated["enabled"]:
+        if _source_enabled(updated):
             provider = _register_source_provider(updated, replace=True)
             return {"ok": True, "source": updated, "provider": _provider_payload(provider)}
         _unregister_source_provider(provider_id)

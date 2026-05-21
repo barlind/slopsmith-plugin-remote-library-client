@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
 import pytest
 
 from remote_library_client.provider import DirectLibraryProvider, provider_id_for_source
@@ -35,19 +38,51 @@ SONGS = [
 
 
 class FakeProvider(DirectLibraryProvider):
-    def __init__(self, tmp_path, local_library_root=None, library_importer=None):
-        super().__init__({
+    def __init__(self, tmp_path, local_library_root=None, library_importer=None, source_extra=None, nam_config_dir=None):
+        source = {
             "baseUrl": "https://studio.example.test",
             "providerId": provider_id_for_source("direct_studio", "https://studio.example.test"),
             "sourceId": "direct_studio",
             "label": "Studio",
-        }, tmp_path, local_library_root, library_importer)
+        }
+        source.update(source_extra or {})
+        super().__init__(source, tmp_path, local_library_root, library_importer, nam_config_dir)
         self.json_calls: list[tuple[str, dict]] = []
+        self.bytes_calls: list[str] = []
 
     def _json(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
         params = params or {}
         self.json_calls.append((path, dict(params)))
         if path.startswith("/songs/"):
+            if path.endswith("/nam-tone-sync"):
+                return {
+                    "schema": "slopsmith.nam-tone-sync.v1",
+                    "sourceId": "direct_studio",
+                    "remoteSongId": "song-one",
+                    "sourceFilename": "song-one.psarc",
+                    "mappings": [{"toneKey": "Clean", "presetRef": "preset:clean"}],
+                    "presets": [{
+                        "ref": "preset:clean",
+                        "name": "Clean NAM",
+                        "modelFile": {
+                            "name": "clean.nam",
+                            "sizeBytes": len(b'{"model":"clean"}'),
+                            "sha256": "sha256:ad5beddb785715813f7466bc58c6b6a2e4b2391743485d2ea805dd4ffdaf4428",
+                            "url": "/songs/song-one/nam-tone-assets/model/clean.nam",
+                        },
+                        "irFile": {
+                            "name": "room.wav",
+                            "sizeBytes": len(b"RIFF-room"),
+                            "sha256": "sha256:4dc883e3c126726807dc5a6b035fbcac6739613c9d977e27377ed0b49dc55b7a",
+                            "url": "/songs/song-one/nam-tone-assets/ir/room.wav",
+                        },
+                        "inputGain": 1.25,
+                        "outputGain": 0.75,
+                        "gateThreshold": -55.0,
+                        "settings": {"cab": "open"},
+                    }],
+                    "warnings": [],
+                }
             song_id = path.split("/", 2)[-1]
             song = next((item for item in SONGS if item["remoteSongId"] == song_id), None)
             if not song:
@@ -106,6 +141,11 @@ class FakeProvider(DirectLibraryProvider):
         }
 
     def _bytes(self, path: str, params: dict | None = None):
+        self.bytes_calls.append(path)
+        if path.endswith("/nam-tone-assets/model/clean.nam"):
+            return b'{"model":"clean"}', "application/json", {}
+        if path.endswith("/nam-tone-assets/ir/room.wav"):
+            return b"RIFF-room", "audio/wav", {}
         if path.endswith("/art"):
             return b"art-bytes", "image/png", {}
         if path.endswith("/package"):
@@ -245,6 +285,78 @@ def test_sync_imports_to_local_library_when_configured(tmp_path):
     assert result["localFilename"] == "direct_studio/song-one.psarc"
     assert result["playFilename"] == "direct_studio/song-one.psarc"
     assert (local_root / "direct_studio" / "song-one.psarc").read_bytes() == b"package-one"
+
+
+def test_sync_imports_enabled_nam_tone_assets_and_mappings(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    provider = FakeProvider(
+        tmp_path / "cache",
+        local_root,
+        source_extra={"syncNamToneAssets": True},
+        nam_config_dir=tmp_path / "config",
+    )
+
+    result = provider.sync_song("song-one")
+
+    assert result["toneSync"] == {
+        "ok": True,
+        "skipped": False,
+        "presetsImported": 1,
+        "mappingsImported": 1,
+        "assetsImported": 2,
+        "assetsReused": 0,
+        "warnings": [],
+    }
+    assert (tmp_path / "config" / "nam_models" / "clean.nam").read_bytes() == b'{"model":"clean"}'
+    assert (tmp_path / "config" / "nam_irs" / "room.wav").read_bytes() == b"RIFF-room"
+    conn = sqlite3.connect(tmp_path / "config" / "nam_tone.db")
+    preset = conn.execute(
+        "SELECT id, name, model_file, ir_file, input_gain, output_gain, gate_threshold, settings_json FROM presets"
+    ).fetchone()
+    mapping = conn.execute("SELECT filename, tone_key, preset_id FROM tone_mappings").fetchone()
+    conn.close()
+    assert preset[1:7] == ("Studio / Clean NAM", "clean.nam", "room.wav", 1.25, 0.75, -55.0)
+    settings = json.loads(preset[7])
+    assert settings["cab"] == "open"
+    assert settings["remoteLibraryClient"]["remotePresetRef"] == "preset:clean"
+    assert mapping == ("direct_studio/song-one.psarc", "Clean", preset[0])
+
+
+def test_sync_skips_nam_tone_assets_when_source_setting_disabled(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    provider = FakeProvider(tmp_path / "cache", local_root, nam_config_dir=tmp_path / "config")
+
+    result = provider.sync_song("song-one")
+
+    assert "toneSync" not in result
+    assert "/songs/song-one/nam-tone-sync" not in [path for path, _params in provider.json_calls]
+
+
+def test_sync_reports_nam_tone_errors_without_failing_song_sync(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    provider = FakeProvider(
+        tmp_path / "cache",
+        local_root,
+        source_extra={"syncNamToneAssets": True},
+        nam_config_dir=tmp_path / "config",
+    )
+    original_json = provider._json
+
+    def broken_json(path: str, params: dict | None = None, timeout: float = 20) -> dict:
+        if path.endswith("/nam-tone-sync"):
+            raise RuntimeError("manifest exploded")
+        return original_json(path, params, timeout)
+
+    provider._json = broken_json
+
+    result = provider.sync_song("song-one")
+
+    assert result["ok"] is True
+    assert result["filename"] == "direct_studio/song-one.psarc"
+    assert result["toneSync"] == {"ok": False, "skipped": False, "error": "manifest exploded"}
 
 
 def test_sync_indexes_local_library_file_when_importer_available(tmp_path):

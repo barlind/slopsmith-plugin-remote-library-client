@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -58,6 +59,7 @@ class DirectLibraryProvider:
         cache_dir: Path,
         local_library_root: Path | None = None,
         library_importer: LibraryImporter | None = None,
+        nam_config_dir: Path | None = None,
     ) -> None:
         self.source = dict(source)
         self.base_url = str(source.get("baseUrl") or "").rstrip("/")
@@ -67,6 +69,7 @@ class DirectLibraryProvider:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.local_library_root = Path(local_library_root) if local_library_root else None
         self.library_importer = library_importer
+        self.nam_config_dir = Path(nam_config_dir) if nam_config_dir else None
         self._metadata_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, dict]] = {}
         self._metadata_cache_lock = threading.RLock()
 
@@ -186,6 +189,222 @@ class DirectLibraryProvider:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _nam_db_path(self) -> Path | None:
+        return self.nam_config_dir / "nam_tone.db" if self.nam_config_dir else None
+
+    def _nam_models_dir(self) -> Path | None:
+        return self.nam_config_dir / "nam_models" if self.nam_config_dir else None
+
+    def _nam_irs_dir(self) -> Path | None:
+        return self.nam_config_dir / "nam_irs" if self.nam_config_dir else None
+
+    def _safe_child(self, root: Path, name: str | None) -> Path | None:
+        if not name:
+            return None
+        root_resolved = root.resolve()
+        path = (root / name).resolve()
+        try:
+            path.relative_to(root_resolved)
+        except ValueError:
+            return None
+        return path
+
+    def _asset_path_from_url(self, url: str) -> str:
+        parsed = parse.urlparse(str(url or ""))
+        if parsed.scheme or parsed.netloc:
+            return parsed.path or "/"
+        return str(url or "")
+
+    def _hash_matches(self, content: bytes, expected: str | None) -> bool:
+        if not expected:
+            return True
+        actual = _sha256_bytes(content)
+        normalized = str(expected).lower().removeprefix("sha256:")
+        return actual == normalized
+
+    def _allocate_nam_asset_path(self, root: Path, name: str, content: bytes, expected_hash: str | None) -> tuple[Path, str, bool]:
+        target = self._safe_child(root, name)
+        if target is None:
+            safe_name = sanitize_filename(Path(name).name, "nam-asset")
+            target = root / safe_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content_hash = _sha256_bytes(content)
+        if target.exists():
+            if _sha256_file(target) == content_hash:
+                return target, target.relative_to(root).as_posix(), False
+            suffix = target.suffix
+            stem = target.stem or "nam-asset"
+            short_hash = (str(expected_hash or content_hash).removeprefix("sha256:") or content_hash)[:10]
+            target = target.with_name(f"{stem}-{short_hash}{suffix}")
+        if target.exists() and _sha256_file(target) == content_hash:
+            return target, target.relative_to(root).as_posix(), False
+        self._write_atomic(target, content)
+        return target, target.relative_to(root).as_posix(), True
+
+    def _download_nam_asset(self, asset: dict | None, asset_type: str) -> tuple[str, bool]:
+        if not asset:
+            return "", False
+        root = self._nam_models_dir() if asset_type == "model" else self._nam_irs_dir()
+        if root is None:
+            raise RuntimeError("NAM Tone config directory is unavailable")
+        root.mkdir(parents=True, exist_ok=True)
+        url = asset.get("url") or ""
+        name = str(asset.get("name") or Path(self._asset_path_from_url(url)).name or f"asset.{asset_type}")
+        content, _media_type, _headers = self._bytes(self._asset_path_from_url(url))
+        expected_hash = asset.get("sha256")
+        if not self._hash_matches(content, expected_hash):
+            raise RuntimeError(f"Downloaded {asset_type} asset hash did not match: {name}")
+        _target, local_name, wrote = self._allocate_nam_asset_path(root, name, content, expected_hash)
+        return local_name, wrote
+
+    def _ensure_nam_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                model_file TEXT,
+                ir_file TEXT,
+                input_gain REAL NOT NULL DEFAULT 1.0,
+                output_gain REAL NOT NULL DEFAULT 0.5,
+                gate_threshold REAL NOT NULL DEFAULT -60.0,
+                settings_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tone_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                tone_key TEXT NOT NULL,
+                preset_id INTEGER NOT NULL,
+                UNIQUE(filename, tone_key),
+                FOREIGN KEY (preset_id) REFERENCES presets(id)
+            )
+        """)
+
+    def _remote_preset_identity(self, preset: dict) -> str:
+        return f"{self.id}:{preset.get('ref') or preset.get('name') or 'preset'}"
+
+    def _find_imported_preset_id(self, conn: sqlite3.Connection, remote_id: str) -> int | None:
+        rows = conn.execute("SELECT id, settings_json FROM presets").fetchall()
+        for preset_id, settings_json in rows:
+            try:
+                settings = json.loads(settings_json or "{}")
+            except json.JSONDecodeError:
+                continue
+            metadata = settings.get("remoteLibraryClient") if isinstance(settings, dict) else None
+            if isinstance(metadata, dict) and metadata.get("remoteId") == remote_id:
+                return int(preset_id)
+        return None
+
+    def _unique_preset_name(self, conn: sqlite3.Connection, preferred: str) -> str:
+        base = preferred.strip() or "Remote NAM preset"
+        existing = {row[0] for row in conn.execute("SELECT name FROM presets").fetchall()}
+        if base not in existing:
+            return base
+        for index in range(2, 1000):
+            candidate = f"{base} {index}"
+            if candidate not in existing:
+                return candidate
+        raise RuntimeError("unable to allocate a unique NAM preset name")
+
+    def _install_nam_tone_sync(self, payload: dict, local_filename: str) -> dict:
+        db_path = self._nam_db_path()
+        if db_path is None:
+            return {"ok": False, "skipped": True, "reason": "NAM Tone config directory is unavailable"}
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        presets = list(payload.get("presets") or [])
+        mappings = list(payload.get("mappings") or [])
+        preset_id_by_ref: dict[str, int] = {}
+        assets_imported = 0
+        assets_reused = 0
+        with sqlite3.connect(db_path) as conn:
+            self._ensure_nam_schema(conn)
+            for preset in presets:
+                model_file, model_wrote = self._download_nam_asset(preset.get("modelFile"), "model")
+                ir_file, ir_wrote = self._download_nam_asset(preset.get("irFile"), "ir")
+                assets_imported += int(bool(model_file and model_wrote)) + int(bool(ir_file and ir_wrote))
+                assets_reused += int(bool(model_file and not model_wrote)) + int(bool(ir_file and not ir_wrote))
+                settings = dict(preset.get("settings") or {})
+                remote_id = self._remote_preset_identity(preset)
+                settings["remoteLibraryClient"] = {
+                    "remoteId": remote_id,
+                    "sourceId": self.source.get("sourceId") or "",
+                    "sourceName": self.label,
+                    "remotePresetRef": preset.get("ref") or "",
+                }
+                existing_id = self._find_imported_preset_id(conn, remote_id)
+                name = str(preset.get("name") or "Remote NAM preset")
+                if existing_id:
+                    existing_name = conn.execute("SELECT name FROM presets WHERE id = ?", (existing_id,)).fetchone()[0]
+                    conn.execute(
+                        "UPDATE presets SET name = ?, model_file = ?, ir_file = ?, input_gain = ?, "
+                        "output_gain = ?, gate_threshold = ?, settings_json = ? WHERE id = ?",
+                        (
+                            existing_name,
+                            model_file,
+                            ir_file,
+                            preset.get("inputGain", 1.0),
+                            preset.get("outputGain", 0.5),
+                            preset.get("gateThreshold", -60.0),
+                            json.dumps(settings),
+                            existing_id,
+                        ),
+                    )
+                    preset_id_by_ref[str(preset.get("ref") or "")] = existing_id
+                else:
+                    display_name = self._unique_preset_name(conn, f"{self.label} / {name}")
+                    cursor = conn.execute(
+                        "INSERT INTO presets (name, model_file, ir_file, input_gain, output_gain, gate_threshold, settings_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            display_name,
+                            model_file,
+                            ir_file,
+                            preset.get("inputGain", 1.0),
+                            preset.get("outputGain", 0.5),
+                            preset.get("gateThreshold", -60.0),
+                            json.dumps(settings),
+                        ),
+                    )
+                    preset_id_by_ref[str(preset.get("ref") or "")] = int(cursor.lastrowid)
+            mappings_imported = 0
+            for mapping in mappings:
+                tone_key = str(mapping.get("toneKey") or "")
+                preset_id = preset_id_by_ref.get(str(mapping.get("presetRef") or ""))
+                if not tone_key or not preset_id:
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO tone_mappings (filename, tone_key, preset_id) VALUES (?, ?, ?)",
+                    (local_filename, tone_key, preset_id),
+                )
+                mappings_imported += 1
+            conn.commit()
+        return {
+            "ok": True,
+            "skipped": False,
+            "presetsImported": len(preset_id_by_ref),
+            "mappingsImported": mappings_imported,
+            "assetsImported": assets_imported,
+            "assetsReused": assets_reused,
+            "warnings": list(payload.get("warnings") or []),
+        }
+
+    def sync_nam_tones(self, song_id: str, local_filename: str) -> dict:
+        if not self.source.get("syncNamToneAssets"):
+            return {"ok": True, "skipped": True, "reason": "disabled"}
+        if not local_filename:
+            return {"ok": False, "skipped": True, "reason": "song was not imported into the local library"}
+        try:
+            payload = self._json(f"/songs/{parse.quote(song_id)}/nam-tone-sync", timeout=20)
+        except RuntimeError as exc:
+            detail = str(exc)
+            if "disabled" in detail or "404" in detail or "not found" in detail:
+                return {"ok": False, "skipped": True, "reason": detail}
+            raise
+        if payload.get("schema") != "slopsmith.nam-tone-sync.v1":
+            return {"ok": False, "skipped": True, "reason": "unsupported NAM tone sync manifest"}
+        return self._install_nam_tone_sync(payload, local_filename)
 
     def _remote_query_params(
         self,
@@ -372,4 +591,9 @@ class DirectLibraryProvider:
             if library_import_error:
                 result["libraryImportState"] = "failed"
                 result["libraryImportError"] = library_import_error
+        if self.source.get("syncNamToneAssets"):
+            try:
+                result["toneSync"] = self.sync_nam_tones(song_id, local_filename)
+            except Exception as exc:
+                result["toneSync"] = {"ok": False, "skipped": False, "error": str(exc)}
         return result

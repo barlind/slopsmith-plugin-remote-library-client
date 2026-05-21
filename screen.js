@@ -134,6 +134,10 @@
         return '<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 7h12m-10 0 1 13h6l1-13M10 7V5h4v2"/></svg>';
     }
 
+    function toneIcon() {
+        return '<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 18V5l12-2v13M9 9l12-2M6 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0Zm15-2a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/></svg>';
+    }
+
     async function api(path, options) {
         const response = await fetch(`/api/plugins/remote_library_client${path}`, {
             headers: { 'Content-Type': 'application/json' },
@@ -192,9 +196,13 @@
             const busyMode = source.providerId ? (state.sourceBusy[source.providerId] || '') : '';
             const busy = !!busyMode;
             const enabled = source.enabled !== false;
+            const syncNamToneAssets = Boolean(source.syncNamToneAssets);
             const toggleLabel = busyMode === 'toggle'
                 ? 'Saving source state'
                 : enabled ? 'Disable source' : 'Enable source';
+            const namToneLabel = busyMode === 'tone-sync'
+                ? 'Saving NAM tone sync setting'
+                : syncNamToneAssets ? 'Disable NAM tone sync' : 'Sync NAM tones with songs';
             const refreshLabel = busyMode === 'refresh' ? 'Refreshing source' : 'Refresh source';
             const removeLabel = busyMode === 'remove' ? 'Removing source' : 'Remove source';
             return `
@@ -206,7 +214,12 @@
                         <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-400">
                             <span class="rounded-full border ${status.classes} px-2 py-0.5" title="${esc(status.title)}" aria-label="${esc(status.title)}">${esc(status.label)}</span>
                             <span>${esc(source.songCount || 0)} songs</span>
+                            ${source.namToneSyncAvailable ? '<span class="rounded-full border border-gray-700 bg-dark-800 px-2 py-0.5 text-gray-300">NAM tones available</span>' : ''}
                         </div>
+                        <label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
+                            <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-sync-nam-source="${esc(source.providerId)}" ${syncNamToneAssets ? 'checked' : ''} ${busy ? 'disabled' : ''} />
+                            <span class="inline-flex items-center gap-1">${toneIcon()} NAM tones</span>
+                        </label>
                         ${offline ? `<div class='mt-2 text-xs text-red-300'>This source appears to be offline.${source.message ? ' ' + esc(source.message) : ''}</div>` : (enabled && !source.checkingStatus && source.message ? `<div class="mt-1 text-xs text-amber-300">${esc(source.message)}</div>` : '')}
                     </div>
                     <div class="flex flex-shrink-0 flex-wrap gap-2">
@@ -304,6 +317,24 @@
         }
     }
 
+    async function toggleNamToneSync(providerId, syncNamToneAssets) {
+        setSourceBusy(providerId, 'tone-sync');
+        try {
+            const result = await api(`/sources/${encodeURIComponent(providerId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ syncNamToneAssets })
+            });
+            if (result.source) {
+                state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
+                renderSources();
+            }
+            await refreshCoreLibraryProviders({ reloadOnChange: false });
+            setMessage(syncNamToneAssets ? 'NAM tone sync enabled for this source.' : 'NAM tone sync disabled for this source.', 'success');
+        } finally {
+            setSourceBusy(providerId, '');
+        }
+    }
+
     async function removeSource(providerId) {
         const source = state.sources.find(item => item.providerId === providerId);
         const label = source?.label || source?.sourceName || source?.baseUrl || 'this source';
@@ -343,6 +374,16 @@
             try {
                 await addSource();
             } catch (error) {
+                setMessage(error.message || 'Action failed.', 'error');
+            }
+        });
+        document.addEventListener('change', async event => {
+            const input = event.target.closest('[data-rlc-sync-nam-source]');
+            if (!input) return;
+            try {
+                await toggleNamToneSync(input.getAttribute('data-rlc-sync-nam-source'), input.checked);
+            } catch (error) {
+                input.checked = !input.checked;
                 setMessage(error.message || 'Action failed.', 'error');
             }
         });
