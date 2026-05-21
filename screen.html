@@ -11,7 +11,6 @@
         <div id="remote-library-client-message" class="mt-2 min-h-5 text-sm text-gray-400"></div>
       </div>
       <div class="flex flex-shrink-0 items-center gap-2">
-        <button class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white" data-rlc-refresh>Refresh</button>
         <button id="rlc-toggle-add" class="h-10 w-10 rounded-lg bg-accent text-lg font-semibold leading-none text-white transition hover:bg-accent-light" data-rlc-toggle-add aria-label="Add source" aria-expanded="false">+</button>
       </div>
     </div>
@@ -20,7 +19,7 @@
       <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(12rem,0.45fr)_auto] md:items-end">
         <label class="space-y-1 text-sm text-gray-300">
           <span class="block text-xs uppercase text-gray-500">Server URL</span>
-          <input id="rlc-base-url" type="url" required class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="http://127.0.0.1:8765" />
+          <input id="rlc-base-url" type="text" required class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="studio.local" />
         </label>
         <label class="space-y-1 text-sm text-gray-300">
           <span class="block text-xs uppercase text-gray-500">Label</span>

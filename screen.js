@@ -6,6 +6,7 @@
         loading: false,
         refreshing: false,
         adding: false,
+        statusTimer: null,
         sourceBusy: {}
     };
     window.__remoteLibraryClientPlugin = state;
@@ -13,7 +14,10 @@
     if (typeof state.loading !== 'boolean') state.loading = false;
     if (typeof state.refreshing !== 'boolean') state.refreshing = false;
     if (typeof state.adding !== 'boolean') state.adding = false;
+    if (!('statusTimer' in state)) state.statusTimer = null;
     if (!state.sourceBusy || typeof state.sourceBusy !== 'object') state.sourceBusy = {};
+
+    const STALE_AFTER_MS = 5 * 60 * 1000;
 
     function esc(value) {
         return String(value == null ? '' : value)
@@ -51,10 +55,83 @@
     }
 
     function normalizeBaseUrl(value) {
-        const raw = String(value || '').trim();
-        if (!raw) return '';
-        if (/^https?:\/\//i.test(raw)) return raw.replace(/\/+$/, '');
-        return `http://${raw}`.replace(/\/+$/, '');
+        return String(value || '').trim().replace(/\/+$/, '');
+    }
+
+    function parseContactTime(value) {
+        const timestamp = Date.parse(value || '');
+        return Number.isFinite(timestamp) ? timestamp : 0;
+    }
+
+    function formatAge(ms) {
+        if (!ms || ms < 1000) return 'just now';
+        const seconds = Math.floor(ms / 1000);
+        if (seconds < 60) return `${seconds}s ago`;
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m ago`;
+        const hours = Math.floor(minutes / 60);
+        if (hours < 48) return `${hours}h ago`;
+        return `${Math.floor(hours / 24)}d ago`;
+    }
+
+    function sourceStatus(source) {
+        const enabled = source.enabled !== false;
+        const contactAt = parseContactTime(source.lastSuccessfulContactAt);
+        const ageMs = contactAt ? Date.now() - contactAt : 0;
+        const ageText = contactAt ? formatAge(ageMs) : 'never';
+        if (!enabled) {
+            return {
+                label: 'Disabled',
+                title: 'This source is disabled.',
+                classes: 'border-gray-800 bg-dark-800 text-gray-400'
+            };
+        }
+        if (source.checkingStatus) {
+            return {
+                label: 'Checking',
+                title: 'Checking source connection.',
+                classes: 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+            };
+        }
+        if (!source.online) {
+            return {
+                label: 'Offline',
+                title: contactAt ? `Last successful contact ${ageText}.` : 'No successful contact yet.',
+                classes: 'border-red-500/30 bg-red-500/10 text-red-300'
+            };
+        }
+        if (!contactAt) {
+            return {
+                label: 'Unknown',
+                title: 'No successful contact yet.',
+                classes: 'border-gray-800 bg-dark-800 text-gray-400'
+            };
+        }
+        if (ageMs > STALE_AFTER_MS) {
+            return {
+                label: 'Stale',
+                title: `Last successful contact ${ageText}.`,
+                classes: 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+            };
+        }
+        return {
+            label: 'Online',
+            title: `Last successful contact ${ageText}.`,
+            classes: 'border-green-500/30 bg-green-500/10 text-green-300'
+        };
+    }
+
+    function powerIcon(enabled) {
+        const iconClass = enabled ? 'h-5 w-5' : 'h-5 w-5 opacity-70';
+        return `<svg class="${iconClass}" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v9m6.36-6.36a9 9 0 1 1-12.72 0"/></svg>`;
+    }
+
+    function refreshIcon(spinning = false) {
+        return `<svg class="h-5 w-5 ${spinning ? 'animate-spin' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 11a8.1 8.1 0 0 0-15.5-2M4 5v4h4m-4 4a8.1 8.1 0 0 0 15.5 2M20 19v-4h-4"/></svg>`;
+    }
+
+    function removeIcon() {
+        return '<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 7h12m-10 0 1 13h6l1-13M10 7V5h4v2"/></svg>';
     }
 
     async function api(path, options) {
@@ -88,15 +165,8 @@
     }
 
     function syncActionButtons() {
-        const refreshBtn = document.querySelector('[data-rlc-refresh]');
         const addBtn = document.querySelector('[data-rlc-form] button[type="submit"]');
         const canInteract = !(state.loading || state.refreshing || state.adding);
-        if (refreshBtn) {
-            refreshBtn.disabled = !canInteract;
-            refreshBtn.textContent = state.loading || state.refreshing ? 'Refreshing...' : 'Refresh';
-            refreshBtn.classList.toggle('opacity-60', !canInteract);
-            refreshBtn.classList.toggle('cursor-not-allowed', !canInteract);
-        }
         if (addBtn) {
             addBtn.disabled = !canInteract;
             addBtn.textContent = state.adding ? 'Adding...' : 'Add';
@@ -109,17 +179,24 @@
         const node = document.getElementById('remote-library-client-sources');
         if (!node) return;
         if (state.loading && !state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">Loading sources...</div>';
+            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL.</div>';
             return;
         }
         if (!state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No sources yet. Click + to add one.</div>';
+            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL.</div>';
             return;
         }
         node.innerHTML = state.sources.map(source => {
-            const offline = !source.online;
+            const status = sourceStatus(source);
+            const offline = source.enabled !== false && !source.checkingStatus && !source.online;
             const busyMode = source.providerId ? (state.sourceBusy[source.providerId] || '') : '';
             const busy = !!busyMode;
+            const enabled = source.enabled !== false;
+            const toggleLabel = busyMode === 'toggle'
+                ? 'Saving source state'
+                : enabled ? 'Disable source' : 'Enable source';
+            const refreshLabel = busyMode === 'refresh' ? 'Refreshing source' : 'Refresh source';
+            const removeLabel = busyMode === 'remove' ? 'Removing source' : 'Remove source';
             return `
             <div class="rounded-xl border border-gray-800/50 bg-dark-700/50 p-4 transition hover:border-accent/20">
                 <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -127,14 +204,15 @@
                         <div class="truncate text-sm font-semibold text-white">${esc(source.label || source.sourceName || source.baseUrl)}</div>
                         <div class="mt-1 truncate text-xs text-gray-500">${esc(source.baseUrl)}</div>
                         <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-400">
-                            <span class="rounded-full border ${source.online ? 'border-green-500/30 bg-green-500/10 text-green-300' : 'border-gray-800 bg-dark-800 text-gray-400'} px-2 py-0.5">${source.online ? 'Online' : 'Offline'}</span>
+                            <span class="rounded-full border ${status.classes} px-2 py-0.5" title="${esc(status.title)}" aria-label="${esc(status.title)}">${esc(status.label)}</span>
                             <span>${esc(source.songCount || 0)} songs</span>
                         </div>
-                        ${offline ? `<div class='mt-2 text-xs text-red-300'>This source appears to be offline.${source.message ? ' ' + esc(source.message) : ''}</div>` : (source.message ? `<div class="mt-1 text-xs text-amber-300">${esc(source.message)}</div>` : '')}
+                        ${offline ? `<div class='mt-2 text-xs text-red-300'>This source appears to be offline.${source.message ? ' ' + esc(source.message) : ''}</div>` : (enabled && !source.checkingStatus && source.message ? `<div class="mt-1 text-xs text-amber-300">${esc(source.message)}</div>` : '')}
                     </div>
-                    <div class="flex flex-shrink-0 gap-2">
-                        <button class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" ${busy ? 'disabled' : ''}>${busyMode === 'refresh' ? 'Refreshing...' : 'Refresh'}</button>
-                        <button class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" ${busy ? 'disabled' : ''}>${busyMode === 'remove' ? 'Removing...' : 'Remove'}</button>
+                    <div class="flex flex-shrink-0 flex-wrap gap-2">
+                        <button class="flex h-10 w-10 items-center justify-center rounded-lg ${enabled ? 'bg-green-900/40 text-green-200 hover:bg-green-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-toggle-source="${esc(source.providerId)}" data-rlc-enabled="${enabled ? 'true' : 'false'}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}" aria-pressed="${enabled ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${powerIcon(enabled)}</button>
+                        <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" aria-label="${esc(refreshLabel)}" title="${esc(refreshLabel)}" ${busy ? 'disabled' : ''}>${refreshIcon(busyMode === 'refresh')}</button>
+                        <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
                 </div>
             </div>
@@ -157,7 +235,7 @@
     async function addSource() {
         const baseUrl = normalizeBaseUrl(document.getElementById('rlc-base-url')?.value || '');
         const label = document.getElementById('rlc-label')?.value.trim() || '';
-        if (!baseUrl) throw new Error('Enter a server URL (for example: http://frodo.local:8765).');
+        if (!baseUrl) throw new Error('Enter a server URL or hostname (for example: studio.local).');
         if (state.adding) return;
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
@@ -168,16 +246,19 @@
             const viewItem = {
                 ...added,
                 online: false,
+                checkingStatus: true,
                 message: 'Checking source status...'
             };
             if (existingIndex >= 0) state.sources[existingIndex] = { ...state.sources[existingIndex], ...viewItem };
             else state.sources.unshift(viewItem);
             renderSources();
-            setMessage('Source added. Checking status...', 'success');
+            setMessage(`Source added as ${added.baseUrl || baseUrl}. Checking status...`, 'success');
             clearAddForm();
             setAddFormOpen(false);
             refreshCoreLibraryProviders({ reloadOnChange: false }).catch(() => {});
-            refresh().catch(error => setMessage(error.message || 'Refresh failed.', 'error'));
+            refresh()
+                .then(() => setMessage('', 'neutral'))
+                .catch(error => setMessage(error.message || 'Refresh failed.', 'error'));
         } finally {
             setBusyState({ adding: false });
         }
@@ -186,7 +267,11 @@
     async function refreshSource(providerId) {
         setSourceBusy(providerId, 'refresh');
         try {
-            await api(`/sources/${encodeURIComponent(providerId)}/refresh`, { method: 'POST', body: JSON.stringify({}) });
+            const result = await api(`/sources/${encodeURIComponent(providerId)}/refresh`, { method: 'POST', body: JSON.stringify({}) });
+            if (result.source) {
+                state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
+                renderSources();
+            }
             await refreshCoreLibraryProviders({ reloadOnChange: false });
             setMessage('Source refreshed.', 'success');
             await refresh();
@@ -195,7 +280,34 @@
         }
     }
 
+    async function toggleSource(providerId, enabled) {
+        setSourceBusy(providerId, 'toggle');
+        try {
+            const result = await api(`/sources/${encodeURIComponent(providerId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ enabled })
+            });
+            if (result.source) {
+                state.sources = state.sources.map(source => {
+                    if (source.providerId !== providerId) return source;
+                    return enabled
+                        ? { ...source, ...result.source, checkingStatus: true, message: 'Checking source status...' }
+                        : result.source;
+                });
+                renderSources();
+            }
+            await refreshCoreLibraryProviders({ reloadOnChange: true });
+            setMessage(enabled ? 'Source enabled.' : 'Source disabled.', 'success');
+            await refresh();
+        } finally {
+            setSourceBusy(providerId, '');
+        }
+    }
+
     async function removeSource(providerId) {
+        const source = state.sources.find(item => item.providerId === providerId);
+        const label = source?.label || source?.sourceName || source?.baseUrl || 'this source';
+        if (!window.confirm(`Remove ${label}?`)) return;
         setSourceBusy(providerId, 'remove');
         try {
             await api(`/sources/${encodeURIComponent(providerId)}`, { method: 'DELETE' });
@@ -211,14 +323,14 @@
         if (state.installed) return;
         state.installed = true;
         document.addEventListener('click', async event => {
-            const target = event.target.closest('[data-rlc-refresh],[data-rlc-toggle-add],[data-rlc-cancel-add],[data-rlc-refresh-source],[data-rlc-remove],[data-rlc-open-screen]');
+            const target = event.target.closest('[data-rlc-toggle-add],[data-rlc-cancel-add],[data-rlc-refresh-source],[data-rlc-toggle-source],[data-rlc-remove],[data-rlc-open-screen]');
             if (!target) return;
             if (target.disabled) return;
             try {
-                if (target.matches('[data-rlc-refresh]')) await refresh();
                 if (target.matches('[data-rlc-toggle-add]')) setAddFormOpen(!state.addOpen, { focus: true });
                 if (target.matches('[data-rlc-cancel-add]')) setAddFormOpen(false);
                 if (target.matches('[data-rlc-refresh-source]')) await refreshSource(target.getAttribute('data-rlc-refresh-source'));
+                if (target.matches('[data-rlc-toggle-source]')) await toggleSource(target.getAttribute('data-rlc-toggle-source'), target.getAttribute('data-rlc-enabled') !== 'true');
                 if (target.matches('[data-rlc-remove]')) await removeSource(target.getAttribute('data-rlc-remove'));
                 if (target.matches('[data-rlc-open-screen]')) window.location.hash = '#remote-library-client';
             } catch (error) {
@@ -243,6 +355,11 @@
             syncActionButtons();
             renderSources();
             refresh().catch(error => setMessage(error.message || 'Refresh failed.', 'error'));
+            if (!state.statusTimer) {
+                state.statusTimer = window.setInterval(() => {
+                    if (document.getElementById('remote-library-client-root')) renderSources();
+                }, 60000);
+            }
         }
     }
 

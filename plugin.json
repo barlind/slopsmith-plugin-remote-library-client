@@ -5,7 +5,6 @@
   "private": false,
   "nav": { "label": "Remote Client", "screen": "remote-library-client" },
   "screen": "screen.html",
-  "settings": { "html": "settings.html" },
   "script": "screen.js",
   "routes": "routes.py",
   "standards": ["plugin-runtime-idempotent.v1"],
