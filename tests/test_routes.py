@@ -92,6 +92,72 @@ def test_add_source_discovers_default_port_and_protocol(tmp_path, monkeypatch):
     assert probe_calls == ["http://studio.local:8765", "https://studio.local:8765"]
 
 
+def test_add_source_tries_explicit_url_before_default_port(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    probe_calls = []
+
+    def probe(base_url: str) -> dict:
+        probe_calls.append(base_url)
+        assert base_url == "https://example.ngrok-free.app"
+        return {
+            "ok": True,
+            "sourceId": "ngrok",
+            "sourceName": "Ngrok Source",
+            "songCount": 7,
+            "server": {"protocol": "slopsmith-direct-library.v1"},
+        }
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: None,
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    client = TestClient(app)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://example.ngrok-free.app"})
+
+    assert added.status_code == 200
+    assert added.json()["source"]["baseUrl"] == "https://example.ngrok-free.app"
+    assert probe_calls == ["https://example.ngrok-free.app"]
+
+
+def test_add_source_explicit_url_falls_back_to_default_port(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    probe_calls = []
+
+    def probe(base_url: str) -> dict:
+        probe_calls.append(base_url)
+        if base_url == "https://studio.local":
+            raise RuntimeError("connection refused")
+        assert base_url == "https://studio.local:8765"
+        return {
+            "ok": True,
+            "sourceId": "studio",
+            "sourceName": "Studio",
+            "songCount": 42,
+            "server": {"protocol": "slopsmith-direct-library.v1"},
+        }
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: None,
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    client = TestClient(app)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://studio.local"})
+
+    assert added.status_code == 200
+    assert added.json()["source"]["baseUrl"] == "https://studio.local:8765"
+    assert probe_calls == ["https://studio.local", "https://studio.local:8765"]
+
+
 def test_add_source_does_not_save_when_unreachable(tmp_path, monkeypatch):
     routes = importlib.import_module("routes")
     routes = importlib.reload(routes)

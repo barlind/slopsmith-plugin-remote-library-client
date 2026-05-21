@@ -28,11 +28,11 @@ def _source_enabled(source: dict) -> bool:
     return source.get("enabled") is not False
 
 
-def _format_base_url(scheme: str, netloc: str) -> str:
+def _format_base_url(scheme: str, netloc: str, *, add_default_port: bool = True) -> str:
     parsed = parse.urlparse(f"{scheme}://{netloc}")
     if not parsed.hostname:
         raise ValueError("baseUrl must include a host")
-    if parsed.port is None:
+    if add_default_port and parsed.port is None:
         netloc = f"{netloc}:{DEFAULT_SOURCE_PORT}"
     return f"{scheme}://{netloc}".rstrip("/")
 
@@ -46,7 +46,9 @@ def _candidate_base_urls(value: str) -> list[str]:
         parsed = parse.urlparse(raw)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("baseUrl must be an http(s) URL")
-        candidates.append(_format_base_url(parsed.scheme, parsed.netloc))
+        candidates.append(_format_base_url(parsed.scheme, parsed.netloc, add_default_port=False))
+        if parsed.port is None:
+            candidates.append(_format_base_url(parsed.scheme, parsed.netloc))
     else:
         raw = raw.lstrip("/")
         if "/" in raw:
