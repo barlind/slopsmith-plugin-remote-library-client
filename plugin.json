@@ -7,13 +7,17 @@
   "screen": "screen.html",
   "script": "screen.js",
   "routes": "routes.py",
-  "standards": ["plugin-runtime-idempotent.v1"],
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
   "capabilities": {
-    "remote-library-client": {
-      "roles": ["consumer"],
-      "commands": ["connect", "browse", "sync", "remove"],
-      "events": ["remote-library-client.activity"],
-      "mode": "optional"
+    "library": {
+      "roles": ["provider"],
+      "operations": ["query-page", "query-artists", "query-stats", "tuning-names", "get-art", "sync-song"],
+      "description": "Registers configured Remote Library Server URLs as browsable library providers with remote metadata, artwork, and song sync.",
+      "mode": "active",
+      "compatibility": "none",
+      "ownership": "multi-provider",
+      "safety": "safe",
+      "version": 1
     }
   }
 }

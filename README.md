@@ -2,6 +2,10 @@
 
 Remote Library Client connects Slopsmith to one or more direct Remote Library Server URLs. Each configured server is registered as a Slopsmith library provider, so it appears in the core Library source selector.
 
+## Runtime Model
+
+The plugin declares the core `library` capability as a provider. Its manifest uses provider `operations` (`query-page`, `query-artists`, `query-stats`, `tuning-names`, `get-art`, `sync-song`) because configured Remote Library Server URLs are exposed through Slopsmith's native library provider coordinator. Connection management stays on the plugin's existing screen and backend routes; those UI actions are not declared as a separate capability domain.
+
 ## Flow
 
 ```mermaid
